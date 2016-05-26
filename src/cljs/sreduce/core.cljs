@@ -33,16 +33,15 @@
      {:style {:color @time-color}}
      time-str]))
 
-(defn plusso [t]
-  (fn [a b] (go (<! (timeout (rand-int t))) (+ a b))))
+(defn plusso [t do-rand]
+  (fn [a b] (go (<! (timeout (if do-rand (rand-int t) t))) (+ a b))))
 
-(defn delay-spool [as t]
+(defn delay-spool [as t do-rand]
   (let [c (chan)]
     (go-loop [[a & as] as]
       (if a
-        (do a
-            (>! c a)
-            (<! (timeout (rand-int t)))
+        (do (>! c a)
+            (<! (timeout (if do-rand (rand-int t) t)))
             (recur as))
         (async/close! c)))
     c))
@@ -55,36 +54,39 @@
              (go (>! c-redn [(inc l) (<! (f a b)) v]))
              v)) pairs)))
 
-(defn wrapv [c] (pipe c (chan 1 (map (fn [x] [0 x nil])))))
+;;(defn wrapv [c] (pipe c (chan 1 (map (fn [x] [0 x nil])))))
 
-(defn pretty-state [{:keys [peers np n]}]
-  (let [peers  (map (fn [l] (let [psd (map deref  (or (peers l) []))]
+(defn wrapv [] (chan 1 (map (fn [x] [0 x nil]))))
+
+(defn pretty-state [{:keys [queues np n]}]
+  (let [queues  (map (fn [l] (let [psd (map deref  (or (queues l) []))]
                              [(take-while identity (take 2 psd)) (count psd) (count (filter not psd))]
                              ))
                     (range 10))]
-    {:n n :np np :peers peers}))
+    {:n n :np np :queues queues}))
 
 (defn assoc-reduce3 [f c-in & {:keys [np-max debug n] :or {np-max 5 debug false}}]
   (let [c-result (promise-chan)
         c-redn    (chan np-max)]
-    (go-loop [{:keys [c-in peers np] :as state} {:c-in (wrapv c-in) :peers {} :np 0 :i 0 :n n}]
+    (go-loop [{:keys [c-in queues np] :as state} {:c-in (pipe c-in (wrapv)) :queues {} :np 0 :i 0 :n n}]
       ;;(prn (pretty-state state))
       (if debug (>! debug (pretty-state state)))
       (if-let [cs (seq (filter identity (list (if (pos? np) c-redn) (if (< np np-max) c-in))))]
         (let [[[l res v]  c]  (alts! cs)]
           (if-not l
             (recur (assoc state :c-in nil))
-            (let [ps        (if v
-                              (do (vreset! v res) (peers l))
-                              (concat (peers 0) [(volatile! res)]))
-                  vs        (launch-reductions c-redn f l ps)
-                  ps        (drop (* (count vs) 2) ps )
-                  np        (cond-> (+ np (count vs)) (pos? l) dec)
-                  l2        (inc l)
-                  ps2       (concat (peers l2) vs)
-                  n         (cond-> (:n state) (zero? l) (dec))]
-              (recur (assoc state :n n :np np :peers (assoc peers l ps l2 ps2))))))
-        (let [reds (->> (seq peers)
+            (let [q (if v
+                       (do (vreset! v res) (queues l))
+                       (concat (queues 0) [(volatile! res)]))
+                  vs  (launch-reductions c-redn f l q)
+                  nr  (count vs)
+                  q   (drop (* 2 nr) q )
+                  np  (cond-> (+ np nr) (pos? l) dec)
+                  l2  (inc l)
+                  q2 (concat (queues l2) vs)
+                  n   (cond-> (:n state) (zero? l) (dec))]
+              (recur (assoc state :n n :np np :queues (assoc queues l q l2 q2))))))
+        (let [reds (->> (seq queues)
                         (sort-by first)
                         (map second)
                         (map first)
@@ -98,9 +100,9 @@
               ;(prn "Returning" (first reds))
               (when debug (async/close! debug))
               (>! c-result (first reds)))
-            (let [c-in (wrapv (chan))]
+            (let [c-in (wrapv)]
               (onto-chan c-in reds)
-              (recur {:n (count reds) :c-in c-in :peers {} :np 0}))))))
+              (recur {:n (count reds) :c-in c-in :queues {} :np 0}))))))
     c-result))
 
 
@@ -115,10 +117,10 @@
 
 (defonce progress (r/atom "progress"))
 
-(defn start-reduce [n t-in t-red np-max]
+(defn start-reduce [n do-rand t-in t-red np-max]
   (prn n t-in t-red np-max)
   (let [dc (chan 10)
-        c (assoc-reduce3 (plusso t-red) (delay-spool (range n) t-in)  :debug dc :np-max np-max :n n)]
+        c (assoc-reduce3 (plusso t-red do-rand) (delay-spool (range n) t-in do-rand)  :debug dc :np-max np-max :n n)]
     (go
       (reset! result "Waiting...")
       (go-loop []
@@ -131,6 +133,7 @@
 (defonce t-red (r/atom 100))
 (defonce t-in (r/atom 100))
 (defonce np-max (r/atom 10))
+(defonce do-rand (r/atom false))
 
 (defn atom-input [name value vmin vmax]
   [:p name 
@@ -140,33 +143,29 @@
                           (when (and (<= v vmax) (>= v vmin))
                             (reset! value v)))}]])
 
-(defn about-page []
-  [:div [:h2 "About sreduce"]
-   [:div
-    [clock]
-    [:a {:href "/"} "go to the home page"]]
-   [:div [:h3 "Concurrent streaming reduction"]
-    [:div
-     (atom-input "N=" n-in 1 1000)
-     (atom-input "Input delay=" t-in 1 1000)
-     (atom-input "Reduction delay=" t-red 1 1000)
-     (atom-input "Concurrency=" np-max 1 100)
-     [:div [:button {:on-click (fn [] (start-reduce @n-in @t-in @t-red @np-max))} "Reduce!"]
-      "=" (str @result)]
-     [:div
-      {:style {:background-color "white"}}
-      [:p [:svg {:height 200}
-           [:g {:key "bleh"} [:text {:x 0 :y 30} (str "n=" (:n @progress) ", np=" (:np @progress))  ]
-            (doall (for [i (range 10)]
-                     (let [y (+ 50 (* 15 i))
-                           w  (+ 1 (* 10 (-> @progress :peers (nth i) second)))
-                           w2 (+ 1 (* 10 (-> @progress :peers (nth i) (nth 2))))]
-                       
-                       [:g {:key i}
-                        [:text {:key (str "text" i) :x 35 :y (+ 10  y) :fill "red" :height 2 :width 40 :font-size 10 :text-anchor "end"} (str  (Math/pow 2 i))]
-                        [:rect {:key (str "rect" i) :height 10 :width w :x 40 :y y :fill "green"}]
-                        [:rect {:key (str "rect2" i) :height 10 :width w2 :x 40 :y y :fill "red"}]]
-                       )))]]]]]]
+(defn reduce-page []
+  [:div
+   [:div {:style {:float "left"}}
+    (atom-input "N=" n-in 1 1000)
+    [:input {:type "checkbox"  :checked @do-rand  :on-change #(swap! do-rand not)}]
+    (str "Randomize time=" @do-rand)
+    (atom-input "Input delay=" t-in 1 1000)
+    (atom-input "Reduction delay=" t-red 1 1000)
+    (atom-input "Concurrency=" np-max 1 100)
+    [:div [:button {:on-click (fn [] (start-reduce @n-in @do-rand @t-in @t-red @np-max))} "Reduce!"]
+     "=" (str @result)]]
+   [:div {:style {:background-color "white" :float "left"}}
+    [:svg {:height 200}
+     [:g {:key "bleh"} [:text {:x 0 :y 30} (str "n=" (:n @progress) ", np=" (:np @progress))  ]
+      (doall (for [i (range 10)]
+               (let [y (+ 50 (* 15 i))
+                     w  (+ 1 (* 10 (-> @progress :queues (nth i) second)))
+                     w2 (+ 1 (* 10 (-> @progress :queues (nth i) (nth 2))))]
+                 [:g {:key i}
+                  [:text {:key (str "text" i) :x 35 :y (+ 10  y) :fill "red" :height 2 :width 40 :font-size 10 :text-anchor "end"} (str  (Math/pow 2 i))]
+                  [:rect {:key (str "rect" i) :height 10 :width w :x 40 :y y :fill "blue"}]
+                  [:rect {:key (str "rect2" i) :height 10 :width w2 :x 40 :y y :fill "red"}]]
+                 )))]]]
    ])
 
 (defn current-page []
@@ -176,10 +175,8 @@
 ;; Routes
 
 (secretary/defroute "/" []
-  (session/put! :current-page #'home-page))
+  (session/put! :current-page #'reduce-page))
 
-(secretary/defroute "/about" []
-  (session/put! :current-page #'about-page))
 
 ;; -------------------------
 ;; Initialize app
@@ -197,3 +194,7 @@
        (secretary/locate-route path))})
   (accountant/dispatch-current!)
   (mount-root))
+
+(defn ^:export run []
+  (r/render [reduce-page]
+            (js/document.getElementById "app")))
